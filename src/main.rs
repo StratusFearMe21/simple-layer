@@ -1,0 +1,653 @@
+use std::{io::Read, os::fd::FromRawFd, time::Duration};
+
+use calloop::{EventLoop, LoopSignal};
+use client::{
+    globals::registry_queue_init,
+    protocol::{
+        // wl_keyboard,
+        wl_output,
+        wl_pointer,
+        wl_seat,
+        wl_shm,
+        wl_surface,
+    },
+    Connection, QueueHandle, WaylandSource,
+};
+use iced_tiny_skia::{
+    core::{gradient::ColorStop, Background, Color, Gradient, Radians, Rectangle, Size},
+    graphics::{Primitive, Viewport},
+    Settings,
+};
+use smithay_client_toolkit::{
+    compositor::{CompositorHandler, CompositorState},
+    delegate_compositor,
+    delegate_layer,
+    delegate_output,
+    delegate_pointer,
+    delegate_registry,
+    delegate_seat,
+    delegate_shm,
+    // delegate_keyboard,
+    output::{OutputHandler, OutputState},
+    reexports::{
+        calloop::{
+            self,
+            generic::Generic,
+            timer::{TimeoutAction, Timer},
+            Interest,
+        },
+        client,
+    },
+    registry::{ProvidesRegistryState, RegistryState},
+    registry_handlers,
+    seat::{
+        // keyboard::{KeyEvent, KeyboardHandler, Modifiers},
+        pointer::{PointerEvent, PointerEventKind, PointerHandler},
+        Capability,
+        SeatHandler,
+        SeatState,
+    },
+    shell::{
+        wlr_layer::{
+            Anchor,
+            Layer,
+            LayerShell,
+            LayerShellHandler,
+            LayerSurface,
+            LayerSurfaceConfigure,
+            // KeyboardInteractivity
+        },
+        WaylandSurface,
+    },
+    shm::{
+        slot::{Buffer, SlotPool},
+        Shm, ShmHandler,
+    },
+};
+use tiny_skia::{Mask, PixmapMut};
+
+fn main() {
+    env_logger::init();
+
+    // All Wayland apps start by connecting the compositor (server).
+    let conn = Connection::connect_to_env().unwrap();
+
+    // Enumerate the list of globals to get the protocols the server implements.
+    let (globals, event_queue) = registry_queue_init(&conn).unwrap();
+    let qh = event_queue.handle();
+
+    // The compositor (not to be confused with the server which is commonly called the compositor) allows
+    // configuring surfaces to be presented.
+    let compositor = CompositorState::bind(&globals, &qh).expect("wl_compositor is not available");
+    // This app uses the wlr layer shell, which may not be available with every compositor.
+    let layer_shell = LayerShell::bind(&globals, &qh).expect("layer shell is not available");
+    // Since we are not using the GPU in this example, we use wl_shm to allow software rendering to a buffer
+    // we share with the compositor process.
+    let shm = Shm::bind(&globals, &qh).expect("wl_shm is not available");
+
+    // A layer surface is created from a surface.
+    let surface = compositor.create_surface(&qh);
+
+    // And then we create the layer shell.
+    let layer =
+        layer_shell.create_layer_surface(&qh, surface, Layer::Bottom, Some("simple_layer"), None);
+    // Configure the layer surface, providing things like the anchor on screen, desired size and the keyboard
+    // interactivity
+    layer.set_anchor(Anchor::TOP | Anchor::RIGHT | Anchor::LEFT);
+    layer.set_size(0, 24);
+    layer.set_exclusive_zone(24);
+
+    // In order for the layer surface to be mapped, we need to perform an initial commit with no attached\
+    // buffer. For more info, see WaylandSurface::commit
+    //
+    // The compositor will respond with an initial configure that we can then use to present to the layer
+    // surface with the correct options.
+    layer.commit();
+
+    // We don't know how large the window will be yet, so lets assume the minimum size we suggested for the
+    // initial memory allocation.
+    let pool = SlotPool::new(1920 * 24 * 4, &shm).expect("Failed to create pool");
+
+    let mut event_loop = EventLoop::try_new().unwrap();
+    let mut simple_layer = SimpleLayer {
+        // Seats and outputs may be hotplugged at runtime, therefore we need to setup a registry state to
+        // listen for seats and outputs.
+        registry_state: RegistryState::new(&globals),
+        seat_state: SeatState::new(&globals, &qh),
+        output_state: OutputState::new(&globals, &qh),
+        shm,
+
+        exit: event_loop.get_signal(),
+        first_configure: true,
+        pool,
+        viewport: Viewport::with_physical_size(
+            Size {
+                width: 0,
+                height: 24,
+            },
+            1.0,
+        ),
+        shift: None,
+        shift_dir: false,
+        buffers: None,
+        animating: false,
+        backend: iced_tiny_skia::Backend::new(Settings::default()),
+        backend_mask: Mask::new(1, 24).unwrap(),
+        layer,
+        pointer: None,
+    };
+
+    let ws = WaylandSource::new(event_queue).unwrap();
+
+    ws.insert(event_loop.handle()).unwrap();
+
+    let loop_handle = qh.clone();
+    event_loop
+        .handle()
+        .insert_source(
+            Timer::from_duration(Duration::from_secs(5)),
+            move |_, _, data: &mut SimpleLayer| {
+                println!("Timer");
+                data.shift = data.shift.xor(Some(0.0));
+                if !data.animating {
+                    data.layer
+                        .wl_surface()
+                        .frame(&loop_handle, data.layer.wl_surface().clone());
+                    data.layer.commit();
+                    data.shift_dir = !data.shift_dir;
+                }
+                data.animating = !data.animating;
+                TimeoutAction::ToDuration(Duration::from_secs(5))
+            },
+        )
+        .unwrap();
+
+    event_loop.run(None, &mut simple_layer, |_| {}).unwrap();
+}
+
+struct SimpleLayer {
+    registry_state: RegistryState,
+    seat_state: SeatState,
+    output_state: OutputState,
+    shm: Shm,
+
+    exit: LoopSignal,
+    first_configure: bool,
+    animating: bool,
+    pool: SlotPool,
+    viewport: Viewport,
+    shift: Option<f32>,
+    shift_dir: bool,
+    buffers: Option<Buffers>,
+    backend: iced_tiny_skia::Backend,
+    backend_mask: Mask,
+    layer: LayerSurface,
+    pointer: Option<wl_pointer::WlPointer>,
+}
+
+impl CompositorHandler for SimpleLayer {
+    fn scale_factor_changed(
+        &mut self,
+        _conn: &Connection,
+        qh: &QueueHandle<Self>,
+        _surface: &wl_surface::WlSurface,
+        new_factor: i32,
+    ) {
+        println!("{}", new_factor);
+        self.viewport = Viewport::with_physical_size(
+            Size {
+                width: (self.viewport.logical_size().width * new_factor as f32) as u32,
+                height: (self.viewport.logical_size().height * new_factor as f32) as u32,
+            },
+            new_factor as f64,
+        );
+        // Initializes our double buffer one we've configured the layer shell
+        self.buffers = Some(Buffers::new(
+            &mut self.pool,
+            self.viewport.physical_width(),
+            self.viewport.physical_height(),
+            wl_shm::Format::Argb8888,
+        ));
+        self.backend_mask = Mask::new(
+            self.viewport.physical_width(),
+            self.viewport.physical_height(),
+        )
+        .unwrap();
+        self.layer.set_buffer_scale(new_factor as u32).unwrap();
+        if !self.animating {
+            self.layer
+                .wl_surface()
+                .frame(qh, self.layer.wl_surface().clone());
+        }
+        self.layer.commit();
+    }
+
+    fn frame(
+        &mut self,
+        _conn: &Connection,
+        qh: &QueueHandle<Self>,
+        _surface: &wl_surface::WlSurface,
+        _time: u32,
+    ) {
+        println!("frame");
+        self.draw(qh);
+    }
+}
+
+impl OutputHandler for SimpleLayer {
+    fn output_state(&mut self) -> &mut OutputState {
+        &mut self.output_state
+    }
+
+    fn new_output(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _output: wl_output::WlOutput,
+    ) {
+    }
+
+    fn update_output(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _output: wl_output::WlOutput,
+    ) {
+    }
+
+    fn output_destroyed(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _output: wl_output::WlOutput,
+    ) {
+    }
+}
+
+impl LayerShellHandler for SimpleLayer {
+    fn closed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _layer: &LayerSurface) {
+        self.exit.stop();
+    }
+
+    fn configure(
+        &mut self,
+        _conn: &Connection,
+        qh: &QueueHandle<Self>,
+        _layer: &LayerSurface,
+        configure: LayerSurfaceConfigure,
+        _serial: u32,
+    ) {
+        if configure.new_size.0 == 0 || configure.new_size.1 == 0 {
+            self.viewport = Viewport::with_physical_size(
+                Size {
+                    width: 0,
+                    height: (24.0 * self.viewport.scale_factor()) as u32,
+                },
+                self.viewport.scale_factor(),
+            );
+            self.backend_mask = Mask::new(1, self.viewport.physical_height()).unwrap();
+        } else {
+            self.viewport = Viewport::with_physical_size(
+                Size {
+                    width: configure.new_size.0 * self.viewport.scale_factor() as u32,
+                    height: configure.new_size.1 * self.viewport.scale_factor() as u32,
+                },
+                self.viewport.scale_factor(),
+            );
+            self.backend_mask = Mask::new(
+                self.viewport.physical_width(),
+                self.viewport.physical_height(),
+            )
+            .unwrap();
+        }
+
+        // Initializes our double buffer one we've configured the layer shell
+        self.buffers = Some(Buffers::new(
+            &mut self.pool,
+            self.viewport.physical_width(),
+            self.viewport.physical_height(),
+            wl_shm::Format::Argb8888,
+        ));
+
+        // Initiate the first draw.
+        if self.first_configure {
+            self.first_configure = false;
+            self.draw(qh);
+        }
+    }
+}
+
+impl SeatHandler for SimpleLayer {
+    fn seat_state(&mut self) -> &mut SeatState {
+        &mut self.seat_state
+    }
+
+    fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
+
+    fn new_capability(
+        &mut self,
+        _conn: &Connection,
+        qh: &QueueHandle<Self>,
+        seat: wl_seat::WlSeat,
+        capability: Capability,
+    ) {
+        /*
+        if capability == Capability::Keyboard && self.keyboard.is_none() {
+            println!("Set keyboard capability");
+            let keyboard = self
+                .seat_state
+                .get_keyboard(qh, &seat, None)
+                .expect("Failed to create keyboard");
+            self.keyboard = Some(keyboard);
+        }
+            */
+
+        if capability == Capability::Pointer && self.pointer.is_none() {
+            println!("Set pointer capability");
+            let pointer = self
+                .seat_state
+                .get_pointer(qh, &seat)
+                .expect("Failed to create pointer");
+            self.pointer = Some(pointer);
+        }
+    }
+
+    fn remove_capability(
+        &mut self,
+        _conn: &Connection,
+        _: &QueueHandle<Self>,
+        _: wl_seat::WlSeat,
+        capability: Capability,
+    ) {
+        /*
+        if capability == Capability::Keyboard && self.keyboard.is_some() {
+            println!("Unset keyboard capability");
+            self.keyboard.take().unwrap().release();
+        }
+            */
+
+        if capability == Capability::Pointer && self.pointer.is_some() {
+            println!("Unset pointer capability");
+            self.pointer.take().unwrap().release();
+        }
+    }
+
+    fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
+}
+
+/*
+impl KeyboardHandler for SimpleLayer {
+    fn enter(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        surface: &wl_surface::WlSurface,
+        _: u32,
+        _: &[u32],
+        keysyms: &[u32],
+    ) {
+        if self.layer.wl_surface() == surface {
+            println!("Keyboard focus on window with pressed syms: {keysyms:?}");
+            self.keyboard_focus = true;
+        }
+    }
+
+    fn leave(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        surface: &wl_surface::WlSurface,
+        _: u32,
+    ) {
+        if self.layer.wl_surface() == surface {
+            println!("Release keyboard focus on window");
+            self.keyboard_focus = false;
+        }
+    }
+
+    fn press_key(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        event: KeyEvent,
+    ) {
+        println!("Key press: {event:?}");
+        // press 'esc' to exit
+        if event.keysym == keysyms::KEY_Escape {
+            self.exit.stop();
+        }
+    }
+
+    fn release_key(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        event: KeyEvent,
+    ) {
+        println!("Key release: {event:?}");
+    }
+
+    fn update_modifiers(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _serial: u32,
+        modifiers: Modifiers,
+    ) {
+        println!("Update modifiers: {modifiers:?}");
+    }
+}
+*/
+
+impl PointerHandler for SimpleLayer {
+    fn pointer_frame(
+        &mut self,
+        _conn: &Connection,
+        qh: &QueueHandle<Self>,
+        _pointer: &wl_pointer::WlPointer,
+        events: &[PointerEvent],
+    ) {
+        use PointerEventKind::*;
+        for event in events {
+            // Ignore events for other surfaces
+            if &event.surface != self.layer.wl_surface() {
+                continue;
+            }
+            match event.kind {
+                Enter { .. } => {
+                    println!("Pointer entered @{:?}", event.position);
+                }
+                Leave { .. } => {
+                    println!("Pointer left");
+                }
+                Motion { .. } => {}
+                Press { button, .. } => {
+                    println!("Press {:x} @ {:?}", button, event.position);
+                    self.shift = self.shift.xor(Some(0.0));
+                    // If we initialize a frame twice in a row, it invalidates one
+                    // of the buffers, so if we're animating, chances are there's
+                    // a frame in the queue
+                    if !self.animating {
+                        self.layer
+                            .wl_surface()
+                            .frame(qh, self.layer.wl_surface().clone());
+                        self.layer.commit();
+                        self.shift_dir = !self.shift_dir;
+                    }
+                    self.animating = !self.animating;
+                }
+                Release { button, .. } => {
+                    println!("Release {:x} @ {:?}", button, event.position);
+                }
+                Axis {
+                    horizontal,
+                    vertical,
+                    ..
+                } => {
+                    println!("Scroll H:{horizontal:?}, V:{vertical:?}");
+                }
+            }
+        }
+    }
+}
+
+impl ShmHandler for SimpleLayer {
+    fn shm_state(&mut self) -> &mut Shm {
+        &mut self.shm
+    }
+}
+
+impl SimpleLayer {
+    pub fn draw(&mut self, qh: &QueueHandle<Self>) {
+        let width = self.viewport.physical_width();
+        let height = self.viewport.physical_height();
+        let logical_size = self.viewport.logical_size();
+        // Draw to the window:
+        if let Some(ref mut buffers) = self.buffers {
+            let canvas = buffers.canvas(&mut self.pool).unwrap();
+            let shift = self.shift.unwrap_or(0.0);
+            let mut pixmap = PixmapMut::from_bytes(canvas, width, height).unwrap();
+            self.backend.draw::<String>(
+                &mut pixmap,
+                &mut self.backend_mask,
+                &[Primitive::Quad {
+                    bounds: Rectangle {
+                        x: 0.0,
+                        y: 0.0,
+                        width: logical_size.width,
+                        height: logical_size.height,
+                    },
+                    background: Background::Gradient(Gradient::Linear(
+                        iced_tiny_skia::core::gradient::Linear {
+                            angle: Radians(std::f32::consts::PI),
+                            stops: [
+                                Some(ColorStop {
+                                    offset: 0.0,
+                                    color: Color::from_rgb(1.0, 0.0, 0.0),
+                                }),
+                                Some(ColorStop {
+                                    offset: 0.5 + shift,
+                                    color: Color::from_rgb(0.0, 1.0, 0.0),
+                                }),
+                                Some(ColorStop {
+                                    offset: 1.0,
+                                    color: Color::from_rgb(0.0, 0.0, 1.0),
+                                }),
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                            ],
+                        },
+                    )),
+                    border_radius: [0.0, 0.0, 0.0, 0.0],
+                    border_width: 0.0,
+                    border_color: Color::TRANSPARENT,
+                }],
+                &self.viewport,
+                &[Rectangle {
+                    x: 0.0,
+                    y: 0.0,
+                    width: width as f32,
+                    height: height as f32,
+                }],
+                Color::WHITE,
+                &[],
+            );
+
+            if let Some(shift) = &mut self.shift {
+                if *shift >= 0.5 {
+                    self.shift_dir = true;
+                } else if *shift <= -0.5 {
+                    self.shift_dir = false;
+                }
+
+                if self.shift_dir {
+                    *shift -= 0.01;
+                } else {
+                    *shift += 0.01;
+                }
+            }
+
+            // Damage the entire window
+            self.layer
+                .wl_surface()
+                .damage_buffer(0, 0, width as i32, height as i32);
+
+            if self.animating {
+                // Request our next frame
+                self.layer
+                    .wl_surface()
+                    .frame(qh, self.layer.wl_surface().clone());
+            }
+
+            // Attach and commit to present.
+            buffers
+                .buffer()
+                .attach_to(self.layer.wl_surface())
+                .expect("buffer attach");
+            self.layer.commit();
+            buffers.flip();
+        }
+    }
+}
+
+delegate_compositor!(SimpleLayer);
+delegate_output!(SimpleLayer);
+delegate_shm!(SimpleLayer);
+
+delegate_seat!(SimpleLayer);
+// delegate_keyboard!(SimpleLayer);
+delegate_pointer!(SimpleLayer);
+
+delegate_layer!(SimpleLayer);
+
+delegate_registry!(SimpleLayer);
+
+impl ProvidesRegistryState for SimpleLayer {
+    fn registry(&mut self) -> &mut RegistryState {
+        &mut self.registry_state
+    }
+    registry_handlers![OutputState, SeatState];
+}
+
+struct Buffers {
+    buffers: [Buffer; 2],
+    current: usize,
+}
+
+impl Buffers {
+    fn new(pool: &mut SlotPool, width: u32, height: u32, format: wl_shm::Format) -> Buffers {
+        Self {
+            buffers: [
+                pool.create_buffer(width as i32, height as i32, width as i32 * 4, format)
+                    .expect("create buffer")
+                    .0,
+                pool.create_buffer(width as i32, height as i32, width as i32 * 4, format)
+                    .expect("create buffer")
+                    .0,
+            ],
+            current: 0,
+        }
+    }
+
+    fn flip(&mut self) {
+        self.current = 1 - self.current;
+    }
+
+    fn buffer(&self) -> &Buffer {
+        &self.buffers[self.current]
+    }
+
+    fn canvas<'a>(&'a self, pool: &'a mut SlotPool) -> Option<&mut [u8]> {
+        self.buffers[self.current].canvas(pool)
+    }
+}
